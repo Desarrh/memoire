@@ -165,6 +165,7 @@ impl Store {
             let e = self.entries.remove(pos);
             if e.kind == Kind::Image {
                 let _ = std::fs::remove_file(self.img_path(id));
+                let _ = std::fs::remove_file(self.dir.join("img").join(format!("{id}.t.bin")));
             }
             self.write(&Op::Del(id));
         }
@@ -246,6 +247,36 @@ impl ImageReader {
 
     pub fn load(&self, id: u64) -> Result<(Vec<u8>, u32, u32), String> {
         load_image(&self.crypt, &self.dir, id)
+    }
+
+    fn thumb_path(&self, id: u64) -> PathBuf {
+        self.dir.join("img").join(format!("{id}.t.bin"))
+    }
+
+    /// Miniature (360 px au plus) depuis le cache, sinon calculée depuis l'image et mise en cache.
+    pub fn thumb(&self, id: u64) -> Result<(Vec<u8>, u32, u32), String> {
+        if let Ok(data) = std::fs::read(self.thumb_path(id)) {
+            if let Ok(png) = self.crypt.open_box(&data) {
+                if let Ok(img) = image::load_from_memory_with_format(&png, image::ImageFormat::Png) {
+                    let img = img.to_rgba8();
+                    let (w, h) = img.dimensions();
+                    return Ok((img.into_raw(), w, h));
+                }
+            }
+        }
+        let (rgba, w, h) = self.load(id)?;
+        self.thumb_from(id, &rgba, w, h)
+    }
+
+    pub fn thumb_from(&self, id: u64, rgba: &[u8], w: u32, h: u32) -> Result<(Vec<u8>, u32, u32), String> {
+        let img = image::RgbaImage::from_raw(w, h, rgba.to_vec()).ok_or("image incohérente")?;
+        let k = (360.0 / w.max(h) as f32).min(1.0);
+        let (tw, th) = (((w as f32 * k) as u32).max(1), ((h as f32 * k) as u32).max(1));
+        let t = image::imageops::thumbnail(&img, tw, th);
+        let mut png = Vec::new();
+        t.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).map_err(|e| format!("PNG : {e}"))?;
+        let _ = socle::paths::write_atomic(&self.thumb_path(id), &self.crypt.seal(&png));
+        Ok((t.into_raw(), tw, th))
     }
 
     /// Enregistre l'image (PNG chiffré) ; renvoie sa taille sur le disque.

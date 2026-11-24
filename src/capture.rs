@@ -289,7 +289,16 @@ unsafe fn run_overlay(frame: &Frame, mode: Mode) -> Option<Rect> {
 
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, ov as isize);
     ShowWindow(hwnd, SW_SHOW);
-    SetForegroundWindow(hwnd);
+    if SetForegroundWindow(hwnd) == 0 || GetForegroundWindow() != hwnd {
+        // repli : s'attacher un instant au fil de l'app au premier plan (aucune entrée simulée)
+        let fg = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
+        let me = windows_sys::Win32::System::Threading::GetCurrentThreadId();
+        if fg != 0 && fg != me && windows_sys::Win32::System::Threading::AttachThreadInput(me, fg, 1) != 0 {
+            BringWindowToTop(hwnd);
+            SetForegroundWindow(hwnd);
+            windows_sys::Win32::System::Threading::AttachThreadInput(me, fg, 0);
+        }
+    }
     SetFocus(hwnd);
 
     let mut msg: MSG = std::mem::zeroed();

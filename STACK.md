@@ -1,4 +1,4 @@
-# Mémoire — stack technique (v0.1.0)
+# Mémoire — stack technique (v0.1.1)
 
 ## 1. But et direction
 Presse-papiers à mémoire longue + capture d'écran, avec OCR local. Remplace Win+V (sans le désactiver) et l'outil Capture. Tout reste local et chiffré.
@@ -34,9 +34,10 @@ Threads : interface, veille (messages Win32), OCR (`THREAD_MODE_BACKGROUND_BEGIN
 
 ## 6. Fonctionnalités
 L'historique s'ouvre avec Alt+V, ou avec le raccourci de secours si Alt+V est pris. On y trouve les filtres Tout, Texte, Images, Fichiers et Épinglés, la recherche floue et les touches ↑↓, Entrée (copie et ferme), Ctrl+P, Suppr, Ctrl+R (révéler un secret), Ctrl+K et F1. La fenêtre se ferme quand elle perd le focus.
+Les images ont une miniature (cache chiffré `img*.t.bin`, 360 px), et leur aperçu agrandi s’affiche au survol d’une ligne.
 Capture avec Ctrl+Maj+S. Dans l'overlay, F choisit une fenêtre, E un écran et R une zone. L'éditeur propose les outils A, R et B, ainsi que Ctrl+Z, Entrée, Ctrl+S et Échap.
 
-Mesuré : 17 Mo de RAM privée au démarrage en mode test, CPU nul au repos, OCR d'une image 1920 × 1080 en ~170 ms, 24 tests.
+Mesuré : 17 Mo de RAM privée au démarrage en mode test, CPU nul au repos, OCR d'une image 1920 × 1080 en ~170 ms, 25 tests (dont `historique_en_colonne`, le bug de la v0.1.0 : lignes posées côte à côte, une seule visible).
 
 ## 7. Intégrations
 Bilan : `Memoire.exe --stats-semaine --json [--semaine AAAA-MM-JJ]` → `{"v":1,"debut","copies","captures","par_jour":[7]}`. `par_jour` compte les copies et les captures, sans les secrets.

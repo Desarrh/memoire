@@ -58,6 +58,7 @@ pub enum Job {
     Saved(u64, u64),
     Ocr(u64, String),
     Preview(u64, Vec<u8>, u32, u32),
+    Thumb(u64, Vec<u8>, u32, u32),
     Shot(Option<Shot>),
     Info(String, bool),
 }
@@ -106,6 +107,10 @@ pub struct App {
     help: bool,
     preview: Option<(u64, egui::TextureHandle)>,
     preview_wanted: u64,
+    thumbs: std::collections::HashMap<u64, Option<egui::TextureHandle>>,
+    thumb_tx: std::sync::mpsc::Sender<u64>,
+    /// lignes dessinées à la dernière image (tests)
+    pub rows: Vec<Rect>,
     editor: Option<Editor>,
     pub hwnd: isize,
     wake: Wake,
@@ -138,6 +143,7 @@ impl App {
             }
         };
         let ocr_tx = spawn_worker(&dir, wake.clone(), s.ocr);
+        let dir2 = dir.clone();
         let a = App {
             pal,
             s,
@@ -158,6 +164,9 @@ impl App {
             help: false,
             preview: None,
             preview_wanted: 0,
+            thumbs: Default::default(),
+            thumb_tx: spawn_thumbs(&dir2, wake.clone()),
+            rows: Vec::new(),
             editor: None,
             hwnd: 0,
             wake,
@@ -270,6 +279,11 @@ impl App {
                     });
                 }
             }
+            Job::Thumb(id, rgba, w, h) => {
+                let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+                let t = CTX.with(|c| c.borrow().as_ref().map(|ctx| ctx.load_texture("miniature", img, egui::TextureOptions::LINEAR)));
+                self.thumbs.insert(id, t);
+            }
             Job::Preview(id, rgba, w, h) => {
                 if id == self.preview_wanted {
                     let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
@@ -291,7 +305,7 @@ impl App {
         let tex = CTX.with(|c| c.borrow().as_ref().map(|ctx| ctx.load_texture("capture", img, egui::TextureOptions::LINEAR)));
         let Some(tex) = tex else { return };
         // fenêtre à la taille de l'image (bornée par la boucle principale à l'écran)
-        self.out.resize = Some(vec2(shot.w as f32 + 24.0, shot.h as f32 + 70.0));
+        self.out.resize = Some(vec2(shot.w as f32, shot.h as f32));
         self.editor = Some(Editor { base: shot.rgba, w: shot.w, h: shot.h, marks: Vec::new(), tool: Tool::Arrow, drag: None, tex });
     }
 
@@ -512,9 +526,9 @@ impl App {
             let avail = ui.available_size();
             let list_w = (avail.x * 0.45).clamp(260.0, 520.0);
             ui.horizontal_top(|ui| {
-                ui.allocate_ui(vec2(list_w, avail.y - 26.0), |ui| self.draw_list(ui));
+                ui.allocate_ui_with_layout(vec2(list_w, avail.y - 26.0), egui::Layout::top_down(egui::Align::Min), |ui| self.draw_list(ui));
                 ui.add_space(10.0);
-                ui.allocate_ui(vec2(ui.available_width(), avail.y - 26.0), |ui| self.draw_preview(ui));
+                ui.allocate_ui_with_layout(vec2(ui.available_width(), avail.y - 26.0), egui::Layout::top_down(egui::Align::Min), |ui| self.draw_preview(ui));
             });
             ui.horizontal(|ui| {
                 let n = self.store.as_ref().map_or(0, |s| s.entries.len());
@@ -576,10 +590,13 @@ impl App {
 
     fn draw_list(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal.clone();
-        let Some(st) = self.store.as_ref() else { return };
+        if self.store.is_none() {
+            return;
+        }
         let row_h = 46.0;
         let mut click = None;
         let mut dbl = None;
+        self.rows.clear();
         let mut sa = egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("liste");
         if self.scroll_to_sel {
             let vis = ui.available_height();
@@ -591,7 +608,7 @@ impl App {
         }
         let out = sa.show_rows(ui, row_h, self.results.len(), |ui, range| {
             for i in range {
-                let Some(e) = st.get(self.results[i]) else { continue };
+                let Some(e) = self.store.as_ref().and_then(|st| st.get(self.results[i])).cloned() else { continue };
                 let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
                 let p = ui.painter();
                 if i == self.sel {
@@ -605,7 +622,36 @@ impl App {
                     Kind::Image => Icon::Image,
                     Kind::Files => Icon::Folder,
                 };
-                icons::paint(p, Rect::from_center_size(pos2(rect.left() + 18.0, rect.center().y), vec2(18.0, 18.0)), icon, pal.muted);
+                let slot = Rect::from_center_size(pos2(rect.left() + 18.0, rect.center().y), vec2(30.0, 30.0));
+                let thumb = if e.kind == Kind::Image {
+                    if !self.thumbs.contains_key(&e.id) {
+                        self.thumbs.insert(e.id, None);
+                        let _ = self.thumb_tx.send(e.id);
+                    }
+                    self.thumbs.get(&e.id).cloned().flatten()
+                } else {
+                    None
+                };
+                match &thumb {
+                    Some(t) => {
+                        let s = t.size_vec2();
+                        let k = (slot.width() / s.x).min(slot.height() / s.y);
+                        p.image(t.id(), Rect::from_center_size(slot.center(), s * k), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                    }
+                    None => icons::paint(p, slot.shrink(6.0), icon, pal.muted),
+                }
+                // aperçu agrandi au survol, instantané (miniature déjà chargée pour les lignes visibles)
+                if let (Some(t), true) = (&thumb, r.hovered()) {
+                    let s = t.size_vec2();
+                    let k = (360.0 / s.x).min(360.0 / s.y).min(1.0);
+                    let at = pos2(rect.right() + 8.0, rect.top());
+                    egui::Area::new(egui::Id::unique(("survol", e.id))).order(egui::Order::Tooltip).fixed_pos(at).fade_in(false).interactable(false).show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).inner_margin(4).show(ui, |ui| {
+                            ui.image((t.id(), s * k));
+                        });
+                    });
+                }
+                self.rows.push(rect);
                 let title = match e.kind {
                     _ if e.secret && !self.revealed.contains(&e.id) => "••••••••••••  (secret masqué)".to_string(),
                     Kind::Image if e.text.trim().is_empty() => format!("Image {} × {}", e.w, e.h),
@@ -647,7 +693,7 @@ impl App {
         let Some(e) = self.selected().cloned() else { return };
         let rect = ui.available_rect_before_wrap();
         ui.painter().rect_filled(rect, 12, pal.surface);
-        let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(12.0)));
+        let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(12.0)).layout(egui::Layout::top_down(egui::Align::Min)));
         ui.horizontal(|ui| {
             let look = Look::tool(&pal);
             if icons::button(ui, Icon::Copy, 32.0, look, "Copier (Entrée)").clicked() {
@@ -757,7 +803,7 @@ impl App {
             ui.add_space(6.0);
             let avail = ui.available_size();
             let (iw, ih) = (ed.w as f32, ed.h as f32);
-            let k = (avail.x / iw).min(avail.y / ih).min(1.0);
+            let k = (avail.x / iw).min(avail.y / ih).min(1.0 / ui.ctx().pixels_per_point());
             let (rect, r) = ui.allocate_exact_size(vec2(iw * k, ih * k), Sense::drag());
             ui.painter().image(ed.tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
             let to_img = |p: egui::Pos2| (((p.x - rect.left()) / k).clamp(0.0, iw), ((p.y - rect.top()) / k).clamp(0.0, ih));
@@ -871,7 +917,10 @@ fn spawn_worker(dir: &std::path::Path, wake: Wake, ocr: bool) -> std::sync::mpsc
                 let img = match img {
                     Some((rgba, w, h)) => {
                         match rd.save(id, &rgba, w, h) {
-                            Ok(size) => wake(Job::Saved(id, size)),
+                            Ok(size) => {
+                                let _ = rd.thumb_from(id, &rgba, w, h);
+                                wake(Job::Saved(id, size))
+                            }
                             Err(e) => wake(Job::Info(format!("Image non gardée : {e}"), true)),
                         }
                         Some((rgba, w, h))
@@ -886,4 +935,47 @@ fn spawn_worker(dir: &std::path::Path, wake: Wake, ocr: bool) -> std::sync::mpsc
         })
         .ok();
     tx
+}
+
+/// Miniatures (360 px, chiffrées sur le disque) : chargées à la demande pour les lignes visibles.
+fn spawn_thumbs(dir: &std::path::Path, wake: Wake) -> std::sync::mpsc::Sender<u64> {
+    let (tx, rx) = std::sync::mpsc::channel::<u64>();
+    let dir = dir.to_path_buf();
+    std::thread::Builder::new()
+        .name("miniatures".into())
+        .spawn(move || {
+            let Ok(rd) = store::ImageReader::new(&dir) else { return };
+            while let Ok(id) = rx.recv() {
+                if let Ok((rgba, w, h)) = rd.thumb(id) {
+                    wake(Job::Thumb(id, rgba, w, h));
+                }
+            }
+        })
+        .ok();
+    tx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bug de la v0.1.0 : les lignes de l'historique se plaçaient côte à côte (mise en page horizontale
+    /// héritée) : on ne voyait qu'une entrée, chaque copie semblait remplacer la précédente.
+    #[test]
+    fn historique_en_colonne() {
+        let dir = store::tests::tmp("ui");
+        let ctx = egui::Context::default();
+        let wake: Wake = Arc::new(|_| {});
+        let mut a = App::new(&ctx, Settings { ocr: false, ..Default::default() }, dir, wake);
+        for s in ["un", "deux", "trois"] {
+            a.store.as_mut().unwrap().add(Entry { text: s.into(), hash: store::hash(s.as_bytes()), t: now(), ..Default::default() });
+        }
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(980.0, 620.0))), ..Default::default() };
+            let _ = ctx.run_ui(raw, |ui| a.frame(ui));
+        }
+        assert_eq!(a.rows.len(), 3, "trois lignes visibles");
+        assert!(a.rows.windows(2).all(|w| w[1].top() >= w[0].bottom() - 0.5 && (w[1].left() - w[0].left()).abs() < 0.5), "lignes empilées : {:?}", a.rows);
+        assert!(a.rows.iter().all(|r| r.right() <= 980.0), "lignes dans la fenêtre");
+    }
 }

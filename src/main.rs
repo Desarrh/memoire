@@ -172,7 +172,7 @@ impl Runner {
         let (x, y, w, h) = work_area();
         let sf = g.window.scale_factor();
         let (cw, ch) = match content {
-            Some(v) => ((v.x as f64 * sf).min(w as f64 * 0.92).max(520.0 * sf), (v.y as f64 * sf).min(h as f64 * 0.92).max(320.0 * sf)),
+            Some(v) => ((v.x as f64 + 24.0 * sf).min(w as f64 * 0.92).max(520.0 * sf), (v.y as f64 + 70.0 * sf).min(h as f64 * 0.92).max(320.0 * sf)),
             None => ((980.0 * sf).min(w as f64 * 0.9), (620.0 * sf).min(h as f64 * 0.85)),
         };
         let _ = g.window.request_inner_size(PhysicalSize::new(cw as u32, ch as u32));
@@ -211,12 +211,15 @@ impl Runner {
         if self.app.as_ref().is_some_and(|a| a.editing()) {
             return self.focus();
         }
+        let was_visible = self.visible;
         self.hide();
         self.capturing = true;
         let p = self.proxy.clone();
         std::thread::spawn(move || {
-            // laisser à Windows le temps d'effacer notre fenêtre
-            std::thread::sleep(std::time::Duration::from_millis(60));
+            // laisser à Windows le temps d'effacer notre fenêtre (animation de fermeture comprise)
+            if was_visible {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
             let shot = match capture::grab() {
                 Ok(f) => capture::select(&f, capture::Mode::Region),
                 Err(e) => {
