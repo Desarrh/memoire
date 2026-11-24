@@ -5,6 +5,7 @@ mod app;
 mod capture;
 mod clip;
 mod crypt;
+mod drag;
 mod ocr;
 mod secrets;
 mod store;
@@ -49,6 +50,9 @@ struct Runner {
     shown_at: Instant,
     capturing: bool,
     start_hidden: bool,
+    /// cachée par perte du focus : un clic sur l'icône juste après doit fermer, pas rouvrir
+    hidden_at: Instant,
+    dragging: bool,
 }
 
 fn data_dir() -> PathBuf {
@@ -154,6 +158,32 @@ impl Runner {
         }
         if out.capture {
             self.start_capture();
+        }
+        if let (Some(on), Some(g)) = (out.topmost, &self.gfx) {
+            g.window.set_window_level(if on { winit::window::WindowLevel::AlwaysOnTop } else { winit::window::WindowLevel::Normal });
+        }
+        if let Some((text, files)) = out.drag {
+            self.drag(text, files);
+        }
+    }
+
+    /// Glisser-déposer OLE (boucle modale de Windows jusqu'au dépôt).
+    fn drag(&mut self, text: Option<String>, files: Vec<PathBuf>) {
+        if socle::testmode::enabled() {
+            return;
+        }
+        let Some(g) = self.gfx.as_mut() else { return };
+        self.dragging = true;
+        let res = drag::run(hwnd_of(&g.window), text.as_deref(), &files);
+        self.dragging = false;
+        // le relâchement du bouton a été pris par la boucle de glisser : egui ne l'a pas vu
+        let raw = g.egui.egui_input_mut();
+        let pos = self.ctx.pointer_latest_pos().unwrap_or_default();
+        raw.events.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+        raw.events.push(egui::Event::PointerGone);
+        g.window.request_redraw();
+        if let (Err(m), Some(a)) = (res, self.app.as_mut()) {
+            a.toast(format!("Glisser impossible : {m}"), true);
         }
     }
 
@@ -299,8 +329,10 @@ impl ApplicationHandler<UserEvent> for Runner {
             // comme Win+V : l'historique se ferme quand on clique ailleurs
             WindowEvent::Focused(false) => {
                 let editing = self.app.as_ref().is_some_and(|a| a.editing());
-                if self.visible && !editing && !socle::testmode::enabled() && self.shown_at.elapsed().as_millis() > 300 {
+                let pinned = self.app.as_ref().is_some_and(|a| a.on_top);
+                if self.visible && !editing && !pinned && !self.dragging && !socle::testmode::enabled() && self.shown_at.elapsed().as_millis() > 300 {
                     self.hide();
+                    self.hidden_at = Instant::now();
                 }
             }
             WindowEvent::RedrawRequested => self.paint(),
@@ -338,6 +370,8 @@ impl ApplicationHandler<UserEvent> for Runner {
                 watch::Event::ShowHistory => {
                     if self.visible && !self.app.as_ref().is_some_and(|a| a.editing()) {
                         self.hide();
+                    } else if self.hidden_at.elapsed().as_millis() < 400 {
+                        // clic sur l'icône : la fenêtre vient de se cacher en perdant le focus, on la laisse fermée
                     } else {
                         self.show(true);
                     }
@@ -453,6 +487,6 @@ fn main() {
     ctx.set_request_repaint_callback(move |info| {
         let _ = p2.send_event(UserEvent::RepaintAt(Instant::now() + info.delay));
     });
-    let mut runner = Runner { ctx, gfx: None, app: None, next_repaint: None, proxy, visible: false, shown_at: Instant::now(), capturing: false, start_hidden };
+    let mut runner = Runner { ctx, gfx: None, app: None, next_repaint: None, proxy, visible: false, shown_at: Instant::now(), capturing: false, start_hidden, hidden_at: Instant::now() - std::time::Duration::from_secs(5), dragging: false };
     let _ = event_loop.run_app(&mut runner);
 }

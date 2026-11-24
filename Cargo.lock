@@ -1195,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "memoire"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "chacha20poly1305",

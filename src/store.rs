@@ -36,6 +36,8 @@ pub struct Entry {
     /// octets sur le disque (image) ou du texte
     pub size: u64,
     pub ocr_done: bool,
+    /// fichier PNG enregistré (capture), pour « Afficher dans l'explorateur »
+    pub path: String,
     pub hash: u64,
 }
 

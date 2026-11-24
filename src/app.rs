@@ -31,6 +31,8 @@ pub struct Settings {
     pub ocr: bool,
     pub sombre: Option<bool>,
     pub dossier_captures: Option<String>,
+    /// ancien comportement : la fenêtre se ferme après une copie
+    pub fermer_apres_copie: bool,
 }
 
 impl Default for Settings {
@@ -49,6 +51,7 @@ impl Default for Settings {
             ocr: true,
             sombre: None,
             dossier_captures: None,
+            fermer_apres_copie: false,
         }
     }
 }
@@ -72,6 +75,10 @@ pub struct Out {
     pub quit: bool,
     pub capture: bool,
     pub resize: Option<Vec2>,
+    /// glisser-déposer à lancer : texte et/ou fichiers
+    pub drag: Option<(Option<String>, Vec<PathBuf>)>,
+    /// fenêtre toujours au premier plan (et plus fermée quand elle perd le focus)
+    pub topmost: Option<bool>,
 }
 
 struct Editor {
@@ -85,7 +92,14 @@ struct Editor {
 }
 
 const PRIVATE: [&str; 8] = ["inprivate", "navigation privée", "private browsing", "incognito", "(private)", "fenêtre privée", "mode privé", "private window"];
-const FILTERS: [&str; 5] = ["Tout", "Texte", "Images", "Fichiers", "Épinglés"];
+const FILTERS: [&str; 6] = ["Tout", "Texte", "Liens", "Images", "Fichiers", "Épinglés"];
+
+/// Lien web ou adresse : un seul mot qui commence comme une URL.
+pub fn is_link(t: &str) -> bool {
+    let t = t.trim();
+    let l = t.to_ascii_lowercase();
+    !t.is_empty() && !t.contains(char::is_whitespace) && (l.starts_with("http://") || l.starts_with("https://") || l.starts_with("www.") || l.starts_with("mailto:") || l.starts_with("ftp://"))
+}
 
 pub struct App {
     pub pal: Palette,
@@ -100,6 +114,9 @@ pub struct App {
     results: Vec<u64>,
     results_key: (String, usize, u64),
     sel: usize,
+    /// multi-sélection (Ctrl+clic, Maj+clic), dans l'ordre du clic
+    multi: Vec<u64>,
+    pub on_top: bool,
     filter: usize,
     revealed: HashSet<u64>,
     toasts: socle::ui::Toasts,
@@ -144,6 +161,8 @@ impl App {
         };
         let ocr_tx = spawn_worker(&dir, wake.clone(), s.ocr);
         let dir2 = dir.clone();
+        // fichiers temporaires des glisser-déposer de la session précédente
+        let _ = std::fs::remove_dir_all(dir.join("glisser"));
         let a = App {
             pal,
             s,
@@ -157,6 +176,8 @@ impl App {
             results: Vec::new(),
             results_key: (String::new(), usize::MAX, 0),
             sel: 0,
+            multi: Vec::new(),
+            on_top: false,
             filter: 0,
             revealed: HashSet::new(),
             toasts,
@@ -199,6 +220,7 @@ impl App {
     pub fn on_show(&mut self) {
         self.query.clear();
         self.sel = 0;
+        self.multi.clear();
         self.filter = 0;
         self.revealed.clear();
         self.focus_search = true;
@@ -341,9 +363,10 @@ impl App {
         }
         let keep = |e: &Entry| match self.filter {
             1 => e.kind == Kind::Text,
-            2 => e.kind == Kind::Image,
-            3 => e.kind == Kind::Files,
-            4 => e.pinned,
+            2 => e.kind == Kind::Text && !e.secret && is_link(&e.text),
+            3 => e.kind == Kind::Image,
+            4 => e.kind == Kind::Files,
+            5 => e.pinned,
             _ => true,
         };
         self.results = if self.query.trim().is_empty() {
@@ -353,6 +376,7 @@ impl App {
         };
         if self.results_key.0 != self.query || self.results_key.1 != self.filter {
             self.sel = 0;
+            self.multi.clear();
             self.scroll_to_sel = true;
         }
         self.sel = self.sel.min(self.results.len().saturating_sub(1));
@@ -391,9 +415,93 @@ impl App {
                 if e.secret && self.s.effacer_secrets_30s {
                     crate::watch::post(crate::watch::WM_CLEAR_LATER, clip::seq() as usize);
                 }
-                self.out.hide = true;
+                self.copied();
             }
             Err(m) => self.toast(m, true),
+        }
+    }
+
+    fn copied(&mut self) {
+        if self.s.fermer_apres_copie && !self.on_top {
+            self.out.hide = true;
+        } else {
+            self.toast("Copié", false);
+        }
+    }
+
+    /// Entrées visées : la multi-sélection si elle existe, sinon l'entrée choisie.
+    fn targets(&self) -> Vec<u64> {
+        if self.multi.is_empty() { self.results.get(self.sel).copied().into_iter().collect() } else { self.multi.clone() }
+    }
+
+    /// Image en PNG lisible par les autres apps : `<données>\glisser\<id>\Capture … .png` (vidé au démarrage).
+    fn export_png(&self, e: &Entry) -> Result<PathBuf, String> {
+        let dir = self.dir.join("glisser").join(e.id.to_string());
+        let when = chrono::DateTime::from_timestamp(e.created, 0).map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H.%M.%S").to_string()).unwrap_or_default();
+        let p = dir.join(format!("{} {when}.png", if e.src == "Capture" { "Capture" } else { "Image" }));
+        if p.exists() {
+            return Ok(p);
+        }
+        let (rgba, w, h) = self.store.as_ref().ok_or("historique fermé")?.load_image(e.id)?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        image::save_buffer(&p, &rgba, w, h, image::ColorType::Rgba8).map_err(|e| e.to_string())?;
+        Ok(p)
+    }
+
+    /// Texte fusionné et fichiers (images exportées en PNG) des entrées données.
+    fn gather(&self, ids: &[u64]) -> Result<(Option<String>, Vec<PathBuf>), String> {
+        let Some(st) = self.store.as_ref() else { return Err("historique fermé".into()) };
+        let (mut texts, mut files) = (Vec::new(), Vec::new());
+        for id in ids {
+            let Some(e) = st.get(*id) else { continue };
+            match e.kind {
+                Kind::Text => texts.push(e.text.clone()),
+                Kind::Files => files.extend(e.text.lines().map(PathBuf::from)),
+                Kind::Image => files.push(self.export_png(e)?),
+            }
+        }
+        Ok(((!texts.is_empty()).then(|| texts.join("\n")), files))
+    }
+
+    /// Copie plusieurs entrées : textes fusionnés (une ligne entre chaque), ou fichiers si images/fichiers.
+    fn copy_many(&mut self, ids: &[u64]) {
+        if ids.len() == 1 {
+            return self.copy_entry(ids[0], None);
+        }
+        let (text, files) = match self.gather(ids) {
+            Ok(v) => v,
+            Err(m) => return self.toast(m, true),
+        };
+        let data = match (text, files.is_empty()) {
+            (Some(t), true) => Data::Text(t),
+            (_, false) => Data::Files(files.iter().map(|p| p.to_string_lossy().into_owned()).collect()),
+            (None, true) => return,
+        };
+        match clip::write(self.hwnd as _, &data) {
+            Ok(()) => {
+                if self.store.as_ref().is_some_and(|st| ids.iter().any(|i| st.get(*i).is_some_and(|e| e.secret))) && self.s.effacer_secrets_30s {
+                    crate::watch::post(crate::watch::WM_CLEAR_LATER, clip::seq() as usize);
+                }
+                self.copied();
+            }
+            Err(m) => self.toast(m, true),
+        }
+    }
+
+    fn start_drag(&mut self, ids: &[u64]) {
+        match self.gather(ids) {
+            Ok((text, files)) if text.is_some() || !files.is_empty() => self.out.drag = Some((text, files)),
+            Ok(_) => {}
+            Err(m) => self.toast(m, true),
+        }
+    }
+
+    /// Fichier lié à l'entrée : capture enregistrée, premier fichier copié.
+    fn file_of(e: &Entry) -> Option<PathBuf> {
+        match e.kind {
+            Kind::Image if !e.path.is_empty() => Some(PathBuf::from(&e.path)),
+            Kind::Files => e.text.lines().next().map(PathBuf::from),
+            _ => None,
         }
     }
 
@@ -406,6 +514,10 @@ impl App {
             Command::new("epingler", "Épingler / désépingler").group("Entrée").keys("Ctrl+P").icon(Icon::Pin).enabled(e.is_some()),
             Command::new("supprimer", "Supprimer l'entrée").group("Entrée").keys("Suppr").icon(Icon::Trash).enabled(e.is_some()),
             Command::new("reveler", "Révéler le secret").group("Entrée").keys("Ctrl+R").icon(Icon::Eye).enabled(e.is_some_and(|e| e.secret)),
+            Command::new("ocr", "Copier le texte de l'image").group("Entrée").keys("Ctrl+Maj+C").icon(Icon::TextFile).enabled(e.is_some_and(|e| e.kind == Kind::Image && !e.text.trim().is_empty())),
+            Command::new("explorer", "Afficher dans l'explorateur").group("Entrée").keys("Ctrl+E").icon(Icon::Folder).enabled(e.is_some_and(|e| Self::file_of(e).is_some())),
+            Command::new("premier_plan", if self.on_top { "Ne plus garder au premier plan" } else { "Garder la fenêtre au premier plan" }).group("Fenêtre").keys("Ctrl+T").icon(Icon::Pin),
+            Command::new("fermer_copie", if self.s.fermer_apres_copie { "Garder la fenêtre ouverte après une copie" } else { "Fermer la fenêtre après une copie" }).group("Mémoire").icon(Icon::Settings),
             Command::new("capture", "Nouvelle capture").group("Capture").keys(self.s.raccourci_capture.clone()).icon(Icon::Camera),
             Command::new("pause", if self.paused { "Reprendre l'enregistrement" } else { "Mettre l'enregistrement en pause" }).group("Mémoire").icon(Icon::Pause),
             Command::new("theme", "Basculer clair / sombre").group("Mémoire").icon(if self.pal.dark { Icon::Sun } else { Icon::Moon }),
@@ -423,9 +535,35 @@ impl App {
         let sel = self.selected().map(|e| e.id);
         match id {
             "copier" => {
-                if let Some(i) = sel {
-                    self.copy_entry(i, None)
+                let ids = self.targets();
+                if !ids.is_empty() {
+                    self.copy_many(&ids)
                 }
+            }
+            "ocr" => {
+                if let Some(e) = self.selected().filter(|e| e.kind == Kind::Image && !e.text.trim().is_empty()) {
+                    let t = e.text.clone();
+                    match clip::write(self.hwnd as _, &Data::Text(t)) {
+                        Ok(()) => self.copied(),
+                        Err(m) => self.toast(m, true),
+                    }
+                }
+            }
+            "explorer" => {
+                if let Some(p) = self.selected().and_then(Self::file_of) {
+                    use std::os::windows::process::CommandExt;
+                    let _ = std::process::Command::new("explorer.exe").raw_arg(format!("/select,\"{}\"", p.display())).spawn();
+                }
+            }
+            "premier_plan" => {
+                self.on_top = !self.on_top;
+                self.out.topmost = Some(self.on_top);
+                self.toast(if self.on_top { "Au premier plan : la fenêtre reste ouverte" } else { "Premier plan désactivé" }, false);
+            }
+            "fermer_copie" => {
+                self.s.fermer_apres_copie = !self.s.fermer_apres_copie;
+                self.saver.touch();
+                self.toast(if self.s.fermer_apres_copie { "La fenêtre se fermera après une copie" } else { "La fenêtre reste ouverte après une copie" }, false);
             }
             "epingler" => {
                 if let (Some(i), Some(st)) = (sel, self.store.as_mut()) {
@@ -433,9 +571,13 @@ impl App {
                 }
             }
             "supprimer" => {
-                if let (Some(i), Some(st)) = (sel, self.store.as_mut()) {
-                    st.delete(i);
+                let ids = self.targets();
+                if let Some(st) = self.store.as_mut() {
+                    for i in ids {
+                        st.delete(i);
+                    }
                 }
+                self.multi.clear();
             }
             "reveler" => {
                 if let Some(i) = sel {
@@ -513,7 +655,7 @@ impl App {
         let pal = self.pal.clone();
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(pal.bg).inner_margin(10)).show(root, |ui| {
             ui.horizontal(|ui| {
-                let w = (ui.available_width() - 330.0).max(200.0);
+                let w = (ui.available_width() - 400.0).max(200.0);
                 let r = socle::ui::search_field(ui, &pal, egui::Id::unique("recherche"), &mut self.query, "Chercher dans l'historique (texte et images)…", w);
                 if self.focus_search && !modal {
                     r.request_focus();
@@ -532,7 +674,8 @@ impl App {
             });
             ui.horizontal(|ui| {
                 let n = self.store.as_ref().map_or(0, |s| s.entries.len());
-                let msg = format!("{} entrées{}  ·  Entrée copier  ·  Ctrl+K commandes  ·  F1 aide", n, if self.paused { "  ·  EN PAUSE" } else { "" });
+                let sel = if self.multi.len() > 1 { format!("  ·  {} sélectionnées", self.multi.len()) } else { String::new() };
+                let msg = format!("{} entrées{sel}{}  ·  Entrée copier  ·  glisser vers une app  ·  Ctrl+K commandes  ·  F1 aide", n, if self.paused { "  ·  EN PAUSE" } else { "" });
                 ui.label(egui::RichText::new(msg).size(taille::ETAT).color(pal.muted));
                 self.toasts.ui(ui, &pal);
             });
@@ -572,7 +715,25 @@ impl App {
             self.run_command("copier");
         }
         if esc {
-            self.out.hide = true;
+            if self.multi.is_empty() { self.out.hide = true } else { self.multi.clear() }
+        }
+        // Alt+1…9 : copier la n-ième entrée affichée
+        let nums = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
+        if let Some(k) = nums.iter().position(|k| ctx.input_mut(|i| i.consume_key(Modifiers::ALT, *k))) {
+            if let Some(&id) = self.results.get(k) {
+                self.sel = k;
+                self.multi.clear();
+                self.copy_entry(id, None);
+            }
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::C)) {
+            self.run_command("ocr");
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::E)) {
+            self.run_command("explorer");
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::T)) {
+            self.run_command("premier_plan");
         }
         if del && self.query.is_empty() {
             self.run_command("supprimer");
@@ -596,6 +757,8 @@ impl App {
         let row_h = 46.0;
         let mut click = None;
         let mut dbl = None;
+        let mut drag = None;
+        let mods = ui.input(|i| i.modifiers);
         self.rows.clear();
         let mut sa = egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("liste");
         if self.scroll_to_sel {
@@ -609,9 +772,9 @@ impl App {
         let out = sa.show_rows(ui, row_h, self.results.len(), |ui, range| {
             for i in range {
                 let Some(e) = self.store.as_ref().and_then(|st| st.get(self.results[i])).cloned() else { continue };
-                let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
+                let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click_and_drag());
                 let p = ui.painter();
-                if i == self.sel {
+                if i == self.sel || self.multi.contains(&e.id) {
                     p.rect_filled(rect, 8, pal.sel_bg);
                 } else if r.hovered() {
                     p.rect_filled(rect, 8, pal.hover_bg);
@@ -651,6 +814,25 @@ impl App {
                         });
                     });
                 }
+                // texte long : aperçu au survol, instantané
+                let long = e.kind != Kind::Image && (!e.secret || self.revealed.contains(&e.id)) && (e.text.len() > 70 || e.text.trim().contains('\n'));
+                if long && r.hovered() && !r.dragged() {
+                    let at = pos2(rect.right() + 8.0, rect.top());
+                    let shown: String = e.text.chars().take(1500).collect();
+                    egui::Area::new(egui::Id::unique(("survol_texte", e.id))).order(egui::Order::Tooltip).fixed_pos(at).fade_in(false).interactable(false).show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).inner_margin(8).show(ui, |ui| {
+                            ui.set_max_width(420.0);
+                            ui.add(egui::Label::new(egui::RichText::new(shown).monospace().size(12.0)).wrap_mode(egui::TextWrapMode::Wrap));
+                        });
+                    });
+                }
+                if r.drag_started() {
+                    drag = Some(e.id);
+                }
+                if i < 9 {
+                    let n = Rect::from_min_size(pos2(rect.right() - 34.0, rect.top() + 4.0), vec2(14.0, 14.0));
+                    socle::ui::paint_text_left(ui, n, n.left(), &format!("{}", i + 1), FontId::proportional(taille::META), pal.muted.gamma_multiply(0.7), 14.0);
+                }
                 self.rows.push(rect);
                 let title = match e.kind {
                     _ if e.secret && !self.revealed.contains(&e.id) => "••••••••••••  (secret masqué)".to_string(),
@@ -677,7 +859,29 @@ impl App {
         });
         ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("liste_off"), out.state.clamped_offset().y));
         if let Some(i) = click {
+            let id = self.results[i];
+            if mods.command {
+                if self.multi.is_empty() {
+                    if let Some(&cur) = self.results.get(self.sel) {
+                        self.multi.push(cur);
+                    }
+                }
+                if let Some(k) = self.multi.iter().position(|x| *x == id) {
+                    self.multi.remove(k);
+                } else {
+                    self.multi.push(id);
+                }
+            } else if mods.shift {
+                let (a, b) = (self.sel.min(i), self.sel.max(i));
+                self.multi = self.results[a..=b].to_vec();
+            } else {
+                self.multi.clear();
+            }
             self.sel = i;
+        }
+        if let Some(id) = drag {
+            let ids = if self.multi.contains(&id) { self.multi.clone() } else { vec![id] };
+            self.start_drag(&ids);
         }
         if let Some(i) = dbl {
             self.sel = i;
@@ -696,14 +900,23 @@ impl App {
         let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(12.0)).layout(egui::Layout::top_down(egui::Align::Min)));
         ui.horizontal(|ui| {
             let look = Look::tool(&pal);
-            if icons::button(ui, Icon::Copy, 32.0, look, "Copier (Entrée)").clicked() {
-                self.copy_entry(e.id, None);
+            if icons::button(ui, Icon::Copy, 32.0, look, if self.multi.len() > 1 { "Copier la sélection (Entrée)" } else { "Copier (Entrée)" }).clicked() {
+                self.run_command("copier");
             }
             if icons::button(ui, Icon::Pin, 32.0, if e.pinned { Look::active(&pal) } else { look }, "Épingler (Ctrl+P)").clicked() {
                 self.run_command("epingler");
             }
             if e.secret && icons::button(ui, Icon::Eye, 32.0, look, "Révéler (Ctrl+R)").clicked() {
                 self.run_command("reveler");
+            }
+            if e.kind == Kind::Image && !e.text.trim().is_empty() && icons::button(ui, Icon::TextFile, 32.0, look, "Copier le texte de l'image (Ctrl+Maj+C)").clicked() {
+                self.run_command("ocr");
+            }
+            if Self::file_of(&e).is_some() && icons::button(ui, Icon::Folder, 32.0, look, "Afficher dans l'explorateur (Ctrl+E)").clicked() {
+                self.run_command("explorer");
+            }
+            if icons::button(ui, Icon::Pin, 32.0, if self.on_top { Look::active(&pal) } else { look }, "Garder au premier plan (Ctrl+T)").clicked() {
+                self.run_command("premier_plan");
             }
             if e.kind == Kind::Text && !e.secret {
                 ui.menu_button("Copier en…", |ui| {
@@ -859,13 +1072,15 @@ impl App {
             self.toast(m, true);
         }
         let Data::Image { rgba, w, h } = data else { return };
+        let mut saved = String::new();
         if save {
             let dir = self.s.dossier_captures.clone().map(PathBuf::from).unwrap_or_else(captures_dir);
             let name = format!("Capture {}.png", chrono::Local::now().format("%Y-%m-%d %H.%M.%S"));
+            let p = dir.join(name);
+            saved = p.to_string_lossy().into_owned();
             let (rgba2, wake) = (rgba.clone(), self.wake.clone());
             std::thread::spawn(move || {
                 let _ = std::fs::create_dir_all(&dir);
-                let p = dir.join(name);
                 match image::save_buffer(&p, &rgba2, w, h, image::ColorType::Rgba8) {
                     Ok(()) => wake(Job::Info(format!("Enregistrée : {}", p.display()), false)),
                     Err(e) => wake(Job::Info(format!("Enregistrement impossible : {e}"), true)),
@@ -874,7 +1089,7 @@ impl App {
         }
         if let Some(st) = self.store.as_mut() {
             let t = now();
-            let e = Entry { kind: Kind::Image, t, created: t, src: "Capture".into(), w, h, hash: store::hash(&rgba) ^ 1, ..Default::default() };
+            let e = Entry { kind: Kind::Image, t, created: t, src: "Capture".into(), w, h, path: saved, hash: store::hash(&rgba) ^ 1, ..Default::default() };
             let (id, new) = st.add(e);
             if new {
                 store::count(&self.dir, true);
@@ -977,5 +1192,53 @@ mod tests {
         assert_eq!(a.rows.len(), 3, "trois lignes visibles");
         assert!(a.rows.windows(2).all(|w| w[1].top() >= w[0].bottom() - 0.5 && (w[1].left() - w[0].left()).abs() < 0.5), "lignes empilées : {:?}", a.rows);
         assert!(a.rows.iter().all(|r| r.right() <= 980.0), "lignes dans la fenêtre");
+    }
+}
+
+#[cfg(test)]
+mod tests_v2 {
+    use super::*;
+
+    #[test]
+    fn liens_reconnus() {
+        assert!(is_link("https://exemple.fr/a?b=1"));
+        assert!(is_link("  www.exemple.fr "));
+        assert!(!is_link("voir https://exemple.fr"));
+        assert!(!is_link("bonjour"));
+    }
+
+    #[test]
+    fn dropfiles_format() {
+        let b = crate::drag::dropfiles(&[PathBuf::from(r"C:\a.png"), PathBuf::from(r"C:\b c.png")]);
+        assert_eq!(&b[..4], &20i32.to_le_bytes());
+        assert_eq!(&b[16..20], &1i32.to_le_bytes(), "chemins en UTF-16");
+        assert_eq!(b.len(), 20 + (8 + 1 + 10 + 1 + 1) * 2);
+        assert!(b.ends_with(&[0, 0, 0, 0]));
+    }
+
+    /// Multi-sélection : textes fusionnés dans l'ordre du clic, images exportées en PNG puis effacées au redémarrage.
+    #[test]
+    fn selection_multiple() {
+        let dir = store::tests::tmp("multi");
+        let wake: Wake = Arc::new(|_| {});
+        let ctx = egui::Context::default();
+        let mut a = App::new(&ctx, Settings { ocr: false, ..Default::default() }, dir.clone(), wake.clone());
+        let st = a.store.as_mut().unwrap();
+        let (x, _) = st.add(Entry { text: "un".into(), hash: 1, t: now(), ..Default::default() });
+        let (y, _) = st.add(Entry { text: "deux".into(), hash: 2, t: now(), ..Default::default() });
+        let (text, files) = a.gather(&[y, x]).unwrap();
+        assert_eq!(text.as_deref(), Some("deux\nun"));
+        assert!(files.is_empty());
+        // image : PNG lisible écrit sous glisser\
+        let rd = store::ImageReader::new(&dir).unwrap();
+        let st = a.store.as_mut().unwrap();
+        let (im, _) = st.add(Entry { kind: Kind::Image, w: 2, h: 2, hash: 3, t: now(), ..Default::default() });
+        rd.save(im, &[255u8; 16], 2, 2).unwrap();
+        let (_, files) = a.gather(&[im]).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].starts_with(dir.join("glisser")) && image::open(&files[0]).is_ok());
+        drop(a);
+        let _a = App::new(&ctx, Settings { ocr: false, ..Default::default() }, dir.clone(), wake);
+        assert!(!dir.join("glisser").exists(), "fichiers temporaires nettoyés");
     }
 }
