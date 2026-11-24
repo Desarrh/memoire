@@ -333,7 +333,7 @@ impl App {
 
     // ---------- index et résultats ----------
 
-    fn search_text(e: &Entry) -> String {
+    pub fn search_text(e: &Entry) -> String {
         let cut = |s: &str| s.chars().take(2000).collect::<String>();
         match e.kind {
             _ if e.secret => format!("secret {}", e.src),

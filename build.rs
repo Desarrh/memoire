@@ -6,7 +6,7 @@ fn main() {
         res.set_icon("assets/icon.ico")
             .set("FileDescription", "Mémoire")
             // commandes sans fenêtre comprises par cet exe (lu par Bilan avant d'appeler --stats-semaine)
-            .set("MemoireCli", "stats-semaine")
+            .set("MemoireCli", "stats-semaine chercher copier")
             .set("ProductName", "Mémoire")
             .set("InternalName", "memoire")
             .set("OriginalFilename", "Memoire.exe")

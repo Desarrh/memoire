@@ -438,6 +438,51 @@ impl ApplicationHandler<UserEvent> for Runner {
     }
 }
 
+/// `--chercher` : même recherche floue que la fenêtre (texte et OCR), sans jamais les secrets.
+pub fn cli_search(dir: &std::path::Path, q: &str, max: usize) -> String {
+    let entries: Vec<store::Entry> = store::Store::open_read(dir).map(|s| s.entries).unwrap_or_default().into_iter().filter(|e| !e.secret).collect();
+    let picked: Vec<&store::Entry> = if q.trim().is_empty() {
+        entries.iter().take(max).collect()
+    } else {
+        let mut idx = socle::fuzzy::Index::new();
+        for (i, e) in entries.iter().enumerate() {
+            let boost = if e.pinned { 40 } else { 0 } + (20 - (i / 500).min(20) as i32);
+            idx.push(&app::App::search_text(e), boost);
+        }
+        idx.search(q, max).into_iter().filter_map(|h| entries.get(h.index)).collect()
+    };
+    let res: Vec<serde_json::Value> = picked
+        .iter()
+        .map(|e| {
+            let line = e.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let apercu = match e.kind {
+                store::Kind::Image if line.is_empty() => format!("Image {} × {}", e.w, e.h),
+                store::Kind::Image => format!("Image : {line}"),
+                _ => line,
+            };
+            let apercu: String = apercu.chars().take(120).collect();
+            let t = if e.kind == store::Kind::Image { "image" } else { "texte" };
+            serde_json::json!({"id": e.id.to_string(), "type": t, "apercu": apercu, "quand": e.t})
+        })
+        .collect();
+    serde_json::json!({"v": 1, "resultats": res}).to_string()
+}
+
+/// `--copier <id>` : remet l'entrée dans le presse-papiers ; refusé pour un secret.
+fn cli_copy(dir: &std::path::Path, id: u64) -> bool {
+    let Ok(st) = store::Store::open_read(dir) else { return false };
+    let Some(e) = st.get(id).filter(|e| !e.secret) else { return false };
+    let data = match e.kind {
+        store::Kind::Text => clip::Data::Text(e.text.clone()),
+        store::Kind::Files => clip::Data::Files(e.text.lines().map(String::from).collect()),
+        store::Kind::Image => match st.load_image(id) {
+            Ok((rgba, w, h)) => clip::Data::Image { rgba, w, h },
+            Err(_) => return false,
+        },
+    };
+    clip::write(std::ptr::null_mut(), &data).is_ok()
+}
+
 fn window_icon() -> Option<winit::window::Icon> {
     let img = image::load_from_memory(include_bytes!("../assets/icon64.png")).ok()?.to_rgba8();
     let (w, h) = img.dimensions();
@@ -460,6 +505,17 @@ fn main() {
                 std::process::exit(2)
             }
         }
+    }
+    // Pour le Lanceur : recherche et copie, en lecture seule, sans fenêtre
+    if let Some(i) = args.iter().position(|a| a == "--chercher") {
+        let q = args.get(i + 1).map(String::as_str).unwrap_or("");
+        let max = args.iter().position(|a| a == "--max").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(20usize);
+        println!("{}", cli_search(&data_dir(), q, max));
+        std::process::exit(0);
+    }
+    if let Some(i) = args.iter().position(|a| a == "--copier") {
+        let ok = args.get(i + 1).and_then(|v| v.parse::<u64>().ok()).is_some_and(|id| cli_copy(&data_dir(), id));
+        std::process::exit(if ok { 0 } else { 2 });
     }
     let start_hidden = args.iter().any(|a| a == "--demarrage");
     let mut instance = None;
@@ -489,4 +545,39 @@ fn main() {
     });
     let mut runner = Runner { ctx, gfx: None, app: None, next_repaint: None, proxy, visible: false, shown_at: Instant::now(), capturing: false, start_hidden, hidden_at: Instant::now() - std::time::Duration::from_secs(5), dragging: false };
     let _ = event_loop.run_app(&mut runner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--chercher` pour le Lanceur : secrets jamais listés, aperçu sur une ligne, rapide sur 5 000 entrées.
+    #[test]
+    fn cli_chercher() {
+        let dir = store::tests::tmp("cli");
+        {
+            let mut st = store::Store::open(&dir).unwrap();
+            for i in 0..5000u64 {
+                let text = format!("note numéro {i}\nsuite {}", "x".repeat(200));
+                st.add(store::Entry { text, hash: i + 10, t: store::now(), ..Default::default() });
+            }
+            st.add(store::Entry { text: "motdepasse ghp_secretabc".into(), secret: true, hash: 1, t: store::now(), ..Default::default() });
+            st.add(store::Entry { text: "facture électricité".into(), hash: 2, t: store::now(), ..Default::default() });
+        }
+        let t0 = std::time::Instant::now();
+        let out = cli_search(&dir, "factur", 20);
+        let ms = t0.elapsed().as_millis();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["resultats"][0]["apercu"], "facture électricité");
+        assert_eq!(v["resultats"][0]["type"], "texte");
+        assert!(!cli_search(&dir, "motdepasse", 20).contains("ghp_"), "secret jamais listé");
+        assert!(!cli_search(&dir, "", 5000).contains("ghp_"));
+        let a = cli_search(&dir, "note", 3);
+        let v: serde_json::Value = serde_json::from_str(&a).unwrap();
+        let ap = v["resultats"][0]["apercu"].as_str().unwrap();
+        assert!(ap.chars().count() <= 120 && !ap.contains('\n'));
+        assert!(ms < 1500, "recherche en {ms} ms");
+        eprintln!("cli_chercher : {ms} ms sur 5 002 entrées");
+    }
 }

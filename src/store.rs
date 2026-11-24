@@ -72,7 +72,21 @@ pub fn hash(b: &[u8]) -> u64 {
 
 impl Store {
     pub fn open(dir: &Path) -> Result<Self, String> {
-        std::fs::create_dir_all(dir.join("img")).map_err(|e| format!("dossier {} : {e}", dir.display()))?;
+        Self::open_with(dir, true)
+    }
+
+    /// Lecture seule (CLI pendant que l'app tourne) : ni création, ni compaction, ni écriture.
+    pub fn open_read(dir: &Path) -> Result<Self, String> {
+        if !dir.join("cle.bin").exists() || !dir.join("journal.bin").exists() {
+            return Err("historique vide".into());
+        }
+        Self::open_with(dir, false)
+    }
+
+    fn open_with(dir: &Path, write: bool) -> Result<Self, String> {
+        if write {
+            std::fs::create_dir_all(dir.join("img")).map_err(|e| format!("dossier {} : {e}", dir.display()))?;
+        }
         let crypt = Crypt::open(&dir.join("cle.bin"))?;
         let path = dir.join("journal.bin");
         let data = std::fs::read(&path).unwrap_or_default();
@@ -100,9 +114,9 @@ impl Store {
         let mut entries: Vec<Entry> = map.into_values().collect();
         entries.sort_by(|a, b| b.t.cmp(&a.t).then(b.id.cmp(&a.id)));
         let next_id = entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| format!("journal : {e}"))?;
+        let file = if write { std::fs::OpenOptions::new().create(true).append(true).open(&path) } else { std::fs::File::open(&path) }.map_err(|e| format!("journal : {e}"))?;
         let mut s = Store { dir: dir.to_path_buf(), crypt, file, entries, ops, next_id, generation: 1 };
-        if s.ops > 1000 && s.ops > s.entries.len() * 2 {
+        if write && s.ops > 1000 && s.ops > s.entries.len() * 2 {
             let _ = s.compact();
         }
         Ok(s)
